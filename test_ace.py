@@ -105,8 +105,8 @@ if __name__ == '__main__':
 
     # Setup dataset.
     testset = CamLocDataset(
-        scene_path / "test",
-        mode=0,  # Default for ACE, we don't need scene coordinates/RGB-D.
+        scene_path / "test_twenty", # "test" To compute the gradient
+        mode=1,  # Default for ACE, we don't need scene coordinates/RGB-D. 0->1
         image_height=opt.image_resolution,
     )
     _logger.info(f'Test images found: {len(testset)}')
@@ -131,15 +131,21 @@ if __name__ == '__main__':
     output_dir = head_network_path.parent
     scene_name = scene_path.name
     # This will contain aggregate scene stats (median translation/rotation errors, and avg processing time per frame).
-    test_log_file = output_dir / f'test_{scene_name}_{opt.session}.txt'
+    test_log_file = output_dir / f'testL2_{scene_name}_{opt.session}.txt'
     _logger.info(f"Saving test aggregate statistics to: {test_log_file}")
     # This will contain each frame's pose (stored as quaternion + translation) and errors.
-    pose_log_file = output_dir / f'poses_{scene_name}_{opt.session}.txt'
+    pose_log_file = output_dir / f'posesL2_{scene_name}_{opt.session}.txt'
     _logger.info(f"Saving per-frame poses and errors to: {pose_log_file}")
+
+    # Store coordinates ################################
+    #coord_log= output_dir / f'3D_coordL1.txt'
 
     # Setup output files.
     test_log = open(test_log_file, 'w', 1)
     pose_log = open(pose_log_file, 'w', 1)
+
+    # Coordinates outputl files ########################
+   # test_coord = open(coord_log, 'w',1)
 
     # Metrics of interest.
     avg_batch_time = 0
@@ -185,113 +191,151 @@ if __name__ == '__main__':
     else:
         ace_visualizer = None
 
+    # coord_list = []
+    grad_list=[]
     # Testing loop.
     testing_start_time = time.time()
-    with torch.no_grad():
-        for image_B1HW, _, gt_pose_B44, _, intrinsics_B33, _, _, filenames in testset_loader:
-            batch_start_time = time.time()
-            batch_size = image_B1HW.shape[0]
+# with torch.no_grad():
+    for image_B1HW, _, gt_pose_B44, _, intrinsics_B33, _, gt_sc, filenames in testset_loader:
+        batch_start_time = time.time()
+        batch_size = image_B1HW.shape[0]
+            
+        image_B1HW = image_B1HW.to(device, non_blocking=True)
+        
+        # Activate gradient
+        image_B1HW.requires_grad=True
 
-            image_B1HW = image_B1HW.to(device, non_blocking=True)
+        # Predict scene coordinates.
+        with autocast(enabled=True):
+            scene_coordinates_B3HW = network(image_B1HW)
 
-            # Predict scene coordinates.
-            with autocast(enabled=True):
-                scene_coordinates_B3HW = network(image_B1HW)
+        # Save the coordinates
+        # Remove path from file name
+        #frame_nameC = Path(filenames).name
+        #test_coord.write(f"{frame_nameC} "
+        # f"{scene_coordinates_B3HW}\n")
 
-            # We need them on the CPU to run RANSAC.
-            scene_coordinates_B3HW = scene_coordinates_B3HW.float().cpu()
+        gt_sc= gt_sc.to(device)
 
-            # Each frame is processed independently.
-            for frame_idx, (scene_coordinates_3HW, gt_pose_44, intrinsics_33, frame_path) in enumerate(
-                    zip(scene_coordinates_B3HW, gt_pose_B44, intrinsics_B33, filenames)):
+        # L1 loss
+        #L1_fn = torch.nn.L1Loss()
+        #Ln_loss = L1_fn(gt_sc,scene_coordinates_B3HW)
 
-                # Extract focal length and principal point from the intrinsics matrix.
-                focal_length = intrinsics_33[0, 0].item()
-                ppX = intrinsics_33[0, 2].item()
-                ppY = intrinsics_33[1, 2].item()
-                # We support a single focal length.
-                assert torch.allclose(intrinsics_33[0, 0], intrinsics_33[1, 1])
+        #L2 loss
+        L2_fn = torch.nn.MSELoss()
+        Ln_loss = L2_fn(gt_sc, scene_coordinates_B3HW)
 
-                # Remove path from file name
-                frame_name = Path(frame_path).name
+        # Reset gradient
+        network.zero_grad()
 
-                # Allocate output variable.
-                out_pose = torch.zeros((4, 4))
+        # Error Backpropagation
+        # L1 or L2 loss
+        Ln_loss.backward()
+         
+        # Append the tensor of the gradient to the list
+        if image_B1HW.grad is not None:
+            grad_list.append(image_B1HW.grad.clone())
+        else:
+            grad_list.append(torch.zeros(10))
 
-                # Compute the pose via RANSAC.
-                inlier_count = dsacstar.forward_rgb(
-                    scene_coordinates_3HW.unsqueeze(0),
-                    out_pose,
-                    opt.hypotheses,
-                    opt.threshold,
-                    focal_length,
-                    ppX,
-                    ppY,
-                    opt.inlieralpha,
-                    opt.maxpixelerror,
-                    network.OUTPUT_SUBSAMPLE,
-                )
+        # We need them on the CPU to run RANSAC.
+        scene_coordinates_B3HW = scene_coordinates_B3HW.float().cpu()
 
-                # Calculate translation error.
-                t_err = float(torch.norm(gt_pose_44[0:3, 3] - out_pose[0:3, 3]))
+        # Each frame is processed independently.
+        for frame_idx, (scene_coordinates_3HW, gt_pose_44, intrinsics_33, frame_path) in enumerate(
+                zip(scene_coordinates_B3HW, gt_pose_B44, intrinsics_B33, filenames)):
 
-                # Rotation error.
-                gt_R = gt_pose_44[0:3, 0:3].numpy()
-                out_R = out_pose[0:3, 0:3].numpy()
+            # Extract focal length and principal point from the intrinsics matrix.
+            focal_length = intrinsics_33[0, 0].item()
+            ppX = intrinsics_33[0, 2].item()
+            ppY = intrinsics_33[1, 2].item()
+            # We support a single focal length.
+            assert torch.allclose(intrinsics_33[0, 0], intrinsics_33[1, 1])
 
-                r_err = np.matmul(out_R, np.transpose(gt_R))
-                # Compute angle-axis representation.
-                r_err = cv2.Rodrigues(r_err)[0]
-                # Extract the angle.
-                r_err = np.linalg.norm(r_err) * 180 / math.pi
+            # Remove path from file name
+            frame_name = Path(frame_path).name
 
-                _logger.info(f"Rotation Error: {r_err:.2f}deg, Translation Error: {t_err * 100:.1f}cm")
+            # Allocate output variable.
+            out_pose = torch.zeros((4, 4))
 
-                if ace_visualizer is not None:
-                    ace_visualizer.render_reloc_frame(
-                        query_pose=gt_pose_44.numpy(),
-                        query_file=frame_path,
-                        est_pose=out_pose.numpy(),
-                        est_error=max(r_err, t_err*100),
-                        sparse_query=opt.render_sparse_queries)
+            # Compute the pose via RANSAC.
+            inlier_count = dsacstar.forward_rgb(
+                scene_coordinates_3HW.unsqueeze(0),
+                out_pose,
+                opt.hypotheses,
+                opt.threshold,
+                focal_length,
+                ppX,
+                ppY,
+                opt.inlieralpha,
+                opt.maxpixelerror,
+                network.OUTPUT_SUBSAMPLE,
+            )
 
-                # Save the errors.
-                rErrs.append(r_err)
-                tErrs.append(t_err * 100)
+            # Calculate translation error.
+            t_err = float(torch.norm(gt_pose_44[0:3, 3] - out_pose[0:3, 3]))
 
-                # Check various thresholds.
-                if r_err < 5 and t_err < 0.1:  # 10cm/5deg
-                    pct10_5 += 1
-                if r_err < 5 and t_err < 0.05:  # 5cm/5deg
-                    pct5 += 1
-                if r_err < 2 and t_err < 0.02:  # 2cm/2deg
-                    pct2 += 1
-                if r_err < 1 and t_err < 0.01:  # 1cm/1deg
-                    pct1 += 1
+            # Rotation error.
+            gt_R = gt_pose_44[0:3, 0:3].numpy()
+            out_R = out_pose[0:3, 0:3].numpy()
 
-                # Write estimated pose to pose file (inverse).
-                out_pose = out_pose.inverse()
+            r_err = np.matmul(out_R, np.transpose(gt_R))
+            # Compute angle-axis representation.
+            r_err = cv2.Rodrigues(r_err)[0]
+            # Extract the angle.
+            r_err = np.linalg.norm(r_err) * 180 / math.pi
 
-                # Translation.
-                t = out_pose[0:3, 3]
+            _logger.info(f"Rotation Error: {r_err:.2f}deg, Translation Error: {t_err * 100:.1f}cm")
 
-                # Rotation to axis angle.
-                rot, _ = cv2.Rodrigues(out_pose[0:3, 0:3].numpy())
-                angle = np.linalg.norm(rot)
-                axis = rot / angle
+            if ace_visualizer is not None:
+                ace_visualizer.render_reloc_frame(
+                    query_pose=gt_pose_44.numpy(),
+                    query_file=frame_path,
+                    est_pose=out_pose.numpy(),
+                    est_error=max(r_err, t_err*100),
+                    sparse_query=opt.render_sparse_queries)
 
-                # Axis angle to quaternion.
-                q_w = math.cos(angle * 0.5)
-                q_xyz = math.sin(angle * 0.5) * axis
+            # Save the errors.
+            rErrs.append(r_err)
+            tErrs.append(t_err * 100)
 
-                # Write to output file. All in a single line.
-                pose_log.write(f"{frame_name} "
-                               f"{q_w} {q_xyz[0].item()} {q_xyz[1].item()} {q_xyz[2].item()} "
-                               f"{t[0]} {t[1]} {t[2]} "
-                               f"{r_err} {t_err} {inlier_count}\n")
+            # Check various thresholds.
+            if r_err < 5 and t_err < 0.1:  # 10cm/5deg
+                pct10_5 += 1
+            if r_err < 5 and t_err < 0.05:  # 5cm/5deg
+                pct5 += 1
+            if r_err < 2 and t_err < 0.02:  # 2cm/2deg
+                pct2 += 1
+            if r_err < 1 and t_err < 0.01:  # 1cm/1deg
+                pct1 += 1
 
-            avg_batch_time += time.time() - batch_start_time
-            num_batches += 1
+            # Write estimated pose to pose file (inverse).
+            out_pose = out_pose.inverse()
+
+            # Translation.
+            t = out_pose[0:3, 3]
+
+            # Rotation to axis angle.
+            rot, _ = cv2.Rodrigues(out_pose[0:3, 0:3].numpy())
+            angle = np.linalg.norm(rot)
+            axis = rot / angle
+
+            # Axis angle to quaternion.
+            q_w = math.cos(angle * 0.5)
+            q_xyz = math.sin(angle * 0.5) * axis
+
+            # Write to output file. All in a single line.
+            pose_log.write(f"{frame_name} "
+                            f"{q_w} {q_xyz[0].item()} {q_xyz[1].item()} {q_xyz[2].item()} "
+                            f"{t[0]} {t[1]} {t[2]} "
+                            f"{r_err} {t_err} {inlier_count}\n")
+
+        avg_batch_time += time.time() - batch_start_time
+        num_batches += 1
+
+    # Save the gradients
+    #torch.save(grad_list,"gradients_L1.pt") # L1 or L2
+    torch.save(grad_list,"gradients_L2.pt")
 
     total_frames = len(rErrs)
     assert total_frames == len(testset)
@@ -329,3 +373,4 @@ if __name__ == '__main__':
 
     test_log.close()
     pose_log.close()
+    #test_coord.close()
